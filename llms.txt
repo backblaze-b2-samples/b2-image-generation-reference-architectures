@@ -1,0 +1,106 @@
+# B2 Reference Architectures for Image Generation
+
+> Reference architectures, third-party integrations, and B2 sample applications for curating image-text corpora, fine-tuning diffusion models, distributing model weights, persisting generated images with provenance, moderating user uploads, and delivering galleries with Backblaze B2.
+
+Canonical Backblaze product documentation: https://www.backblaze.com/docs/cloud-storage-ai-machine-learning. Use this index to select an architecture, integration configuration, or sample application.
+
+## Start here
+
+- [Image generation summary](docs/image-generation.md): Concise workload and capability overview.
+- [Architecture index](docs/architecture-index.md): Human-readable index generated from the catalog.
+- [Machine-readable catalog](catalog/architectures.yaml): Audiences, workflows, capabilities, integrations, security, and compliance.
+- [Full text](llms-full.txt): Summary and every architecture in one file.
+
+## Architectures
+
+- [Collect and curate image-text corpora into streamable training shards](architectures/image-text-corpus-curation/architecture.md): Bulk-download URL and caption lists into WebDataset shards on B2, score them for CLIP alignment, quality, NSFW and near-duplicates, and write filtered subsets as new immutable shards with a subset manifest. Raw shards are never rewritten; diffusion training streams the subsets directly.
+- [Fine-tune LoRA and diffusion models with versioned checkpoints](architectures/diffusion-finetune-checkpoints/architecture.md): Train LoRA, DreamBooth or full fine-tunes on curated subsets, and write each run's dataset snapshot, captions, checkpoints, sample grids and final .safetensors to run-scoped prefixes so interrupted runs resume and released weights trace back to their data.
+- [Distribute base checkpoints and LoRAs to a GPU inference fleet](architectures/model-weight-distribution/architecture.md): Keep base checkpoints, VAEs, ControlNets and LoRAs once under a B2 models/ prefix; ComfyUI hosts, serverless GPU functions and CI pull from it into node-local caches with read-only keys and skip unchanged files.
+- [Generate images and persist every output with provenance manifests](architectures/generation-output-provenance/architecture.md): Text-to-image and edit apps call self-hosted pipelines or hosted APIs, write every output to B2 immediately, and store a SHA-256 manifest of provider, model, prompt, params, seed and parent asset beside it so remix lineage, replays and audits stay possible.
+- [Ingest, moderate and purge user-uploaded reference images](architectures/user-upload-moderation-personalization/architecture.md): Browsers upload selfies, product photos and reference images directly to a private uploads/ prefix with presigned PUTs; an Event Notification triggers moderation and EXIF stripping; approved items reach edit APIs and likeness-LoRA training only as short-lived presigned GETs, and subject deletion coordinates active writers, every B2 version, quarantined originals, and provider copies.
+- [Serve generated galleries through a CDN with on-the-fly variants](architectures/gallery-cdn-delivery/architecture.md): Approved outputs are served from a private B2 origin through Cloudflare Workers or a bunny.net pull zone with S3 authentication, and imgproxy resizes and converts originals on request so per-size variants live in the edge cache instead of the bucket.
+
+## Third-party integrations
+
+- [img2dataset](https://github.com/rom1504/img2dataset): fsspec / s3fs. Set output_folder to `s3://<bucket>/<prefix>` and put client_kwargs.endpoint_url `https://s3.<region>.backblazeb2.com` in ~/.config/fsspec/s3.json; write webdataset or parquet output (the tfrecord writer bypasses fsspec). Architectures: architectures/image-text-corpus-curation/architecture.md
+- [s3fs (fsspec)](https://s3fs.readthedocs.io/en/latest/): fsspec / s3fs. Pass endpoint_url `https://s3.<region>.backblazeb2.com` to S3FileSystem (or client_kwargs.endpoint_url in fsspec config) with a scoped B2 application key as key and secret. Architectures: architectures/image-text-corpus-curation/architecture.md
+- [WebDataset](https://github.com/webdataset/webdataset): S3 custom endpoint. Open shards with `pipe:aws s3 cp --endpoint-url https://s3.<region>.backblazeb2.com s3://<bucket>/<shard>.tar -`, a gopen handler backed by boto3 with endpoint_url, or presigned HTTPS shard URLs. Architectures: architectures/image-text-corpus-curation/architecture.md
+- [LanceDB](https://lancedb.com/): S3 custom endpoint. Use the pinned LanceDB 0.20.0 / pylance 0.23.2 connection profile in examples/lancedb.md, with the B2 endpoint, region and scoped credentials; serialize all table mutations through one writer service ([setup guide](https://github.com/lance-format/lance/blob/v0.23.2/rust/lance-table/src/io/commit.rs)). Architectures: architectures/image-text-corpus-curation/architecture.md
+- [Ray Train](https://docs.ray.io/en/latest/train/user-guides/persistent-storage.html): S3 custom endpoint. Set RunConfig storage_path to `s3://<bucket>/checkpoints?endpoint_override=https://s3.<region>.backblazeb2.com`, or set AWS_ENDPOINT_URL_S3 with AWS credential variables holding a B2 application key; Ray's persistent-storage guide covers Backblaze B2. Architectures: architectures/diffusion-finetune-checkpoints/architecture.md
+- [MLflow](https://mlflow.org/docs/latest/self-hosting/architecture/artifact-store/): Built-in Backblaze B2 option. Artifact store URI `b2://<bucket>@s3.<region>.backblazeb2.com/<path>` with AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_DEFAULT_REGION set to a B2 application key and region. Architectures: architectures/diffusion-finetune-checkpoints/architecture.md
+- [DVC](https://doc.dvc.org/user-guide/data-management/remote-storage/amazon-s3): S3 custom endpoint. Run `dvc remote modify <remote> endpointurl https://s3.<region>.backblazeb2.com` and store the B2 application key with `dvc remote modify --local` access_key_id and secret_access_key. Architectures: architectures/diffusion-finetune-checkpoints/architecture.md
+- [rclone](https://rclone.org/b2/): Built-in Backblaze B2 option. Use the native `b2` backend with a scoped application key (or the `s3` backend with the B2 endpoint); `rclone sync` and `rclone copy` move data between B2 and local disk. Architectures: architectures/diffusion-finetune-checkpoints/architecture.md, architectures/model-weight-distribution/architecture.md
+- [Replicate](https://replicate.com/docs/topics/predictions/input-files): Presigned URLs. Presigned B2 GET URLs passed as hosted-file inputs; outputs are copied back to B2 because API output files are deleted after one hour ([setup guide](https://replicate.com/docs/topics/predictions/data-retention)). Architectures: architectures/diffusion-finetune-checkpoints/architecture.md, architectures/generation-output-provenance/architecture.md, architectures/user-upload-moderation-personalization/architecture.md
+- [ComfyUI Cloud Storage nodes](https://github.com/backblaze-labs/comfyui-cloud-storage): Built-in Backblaze B2 option. "Backblaze B2" provider preset (COMFY_S3_PROVIDER, COMFY_S3_REGION) or COMFY_S3_ENDPOINT_URL; credentials resolve from env vars or a server-side JSON profile, never workflow JSON. Architectures: architectures/model-weight-distribution/architecture.md, architectures/generation-output-provenance/architecture.md
+- [hf-cache-sync](https://github.com/backblaze-labs/hf-cache-sync): Built-in Backblaze B2 option. Set B2_APPLICATION_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET, B2_REGION and B2_ENDPOINT (or the YAML storage block); the boto3 client talks to the B2 S3 endpoint. Architectures: architectures/model-weight-distribution/architecture.md
+- [Modal CloudBucketMount](https://modal.com/docs/reference/modal.CloudBucketMount): S3 custom endpoint. `CloudBucketMount(bucket_name, bucket_endpoint_url="https://s3.<region>.backblazeb2.com", key_prefix="models/", read_only=True, secret=...)` with a secret holding a B2 application key. Architectures: architectures/model-weight-distribution/architecture.md
+- [fal.ai](https://fal.ai/docs/documentation/model-apis/fal-cdn): Presigned URLs. image_url inputs accept presigned S3-compatible URLs; outputs are copied back to B2. Architectures: architectures/generation-output-provenance/architecture.md, architectures/user-upload-moderation-personalization/architecture.md
+- [Pixeltable](https://docs.pixeltable.com/integrations/cloud-storage): Built-in Backblaze B2 option. Backblaze B2 destination `https://s3.<region>.backblazeb2.com/<bucket>/<prefix>/` with b2_profile in config.toml and keys under a [b2] AWS credentials profile. Architectures: architectures/generation-output-provenance/architecture.md
+- [Uppy + Companion](https://uppy.io/docs/companion/): S3 custom endpoint. Set s3.endpoint (COMPANION_AWS_ENDPOINT) to `https://s3.<region>.backblazeb2.com` and s3.region to the bucket region; browsers upload straight to the bucket with presigned PUT or multipart requests, so configure bucket CORS. Architectures: architectures/user-upload-moderation-personalization/architecture.md
+- [Cloudflare Workers (private bucket)](https://www.backblaze.com/docs/cloud-storage-deliver-private-backblaze-b2-content-through-cloudflare-cdn): CDN origin. Deploy a Worker that signs origin requests to `s3.<region>.backblazeb2.com` with a read-only application key; the bucket stays private behind the CDN. Architectures: architectures/gallery-cdn-delivery/architecture.md
+- [bunny.net](https://www.backblaze.com/docs/cloud-storage-integrate-bunnynet-with-backblaze-b2): CDN origin. Set the pull zone origin to the bucket's S3 URL, enable S3 Authentication with the key ID, application key and bucket region, and enable Block Root Path Access ([setup guide](https://docs.bunny.net/cdn/integrations/storage/backblaze)). Architectures: architectures/gallery-cdn-delivery/architecture.md
+- [imgproxy](https://docs.imgproxy.net/image_sources/amazon_s3): S3 custom endpoint. Set `IMGPROXY_USE_S3=true`, `IMGPROXY_S3_ENDPOINT=https://s3.<region>.backblazeb2.com` and `IMGPROXY_S3_REGION` to the bucket region; source URLs use `s3://<bucket>/<key>`. Architectures: architectures/gallery-cdn-delivery/architecture.md
+
+## Sample applications: closest workflow matches
+
+- [img2dataset to WebDataset on B2](https://github.com/backblaze-b2-samples/img2dataset-webdataset-object-storage): img2dataset shards, parquet and stats streamed into B2 with no local staging.
+- [DataComp image-text filtering](https://github.com/backblaze-b2-samples/datacomp-image-text-filtering): CLIP scoring of streamed shards with filtered shards and metrics written back.
+- [Data-Juicer multimodal curation](https://github.com/backblaze-b2-samples/data-juicer-multimodal-curation): Data-Juicer recipes over raw shards with refined outputs and stats per run.
+- [fastdup dataset cleaning](https://github.com/backblaze-b2-samples/fastdup-dataset-cleaning): Duplicate, outlier and broken-file detection with server-side-copy quarantine.
+- [LoRA Training Studio](https://github.com/backblaze-b2-samples/lora-training-studio): Diffusers and peft LoRA training with every artifact under a run prefix.
+- [AI Headshot Studio](https://github.com/backblaze-b2-samples/ai-headshot-studio): Likeness LoRA from selfies with presigned-only access and per-subject purge.
+- [Genblaze multi-provider sample](https://github.com/backblaze-labs/genblaze-gen-media-multi-provider-sample): Multi-provider pipeline with run-scoped prefixes and lifecycle suggestions.
+- [Genblaze x GMICloud pipeline](https://github.com/backblaze-labs/genblaze-gmicloud-pipeline): Anchor image fanned out to video models with manifests on B2.
+- [Image Generation Prompt Flow](https://github.com/backblaze-b2-samples/image-generation-prompt-flow): Provider comparison app with image bytes on B2 and prompt history in SQLite.
+- [AI Moodboard Generator](https://github.com/backblaze-b2-samples/ai-moodboard-generator): Generated pins with sha256 sidecars delivered by presigned or CDN URLs.
+- [AI Product Photo Studio](https://github.com/backblaze-b2-samples/ai-product-photo-studio): Presigned reference handoff to image edits with per-run manifests.
+- [AI Sticker Pack Generator](https://github.com/backblaze-b2-samples/ai-sticker-pack-generator): Bucket as the system of record for generated packs, no database.
+- [Comic Storyboard](https://github.com/backblaze-b2-samples/comic-storyboard-b2): Character-consistent panels with variant lineage and SHA-256 manifests.
+- [AI SaaS Starter Kit](https://github.com/backblaze-labs/ai-saas-starter-kit): Multi-tenant generation into B2 with presigned browser uploads.
+- [CLIP NSFW image moderation](https://github.com/backblaze-b2-samples/clip-nsfw-image-moderation): Approve or quarantine routing with JSONL and CSV audit logs.
+- [LaMa batch inpainting](https://github.com/backblaze-b2-samples/lama-batch-inpainting): Source, mask and output prefixes with an approval step.
+- [rembg product background removal](https://github.com/backblaze-b2-samples/rembg-product-background-removal): Batch transparent cutouts with an optional public or CDN URL base.
+
+## Sample applications: operational building blocks
+
+- [OpenCLIP batch embeddings](https://github.com/backblaze-b2-samples/openclip-batch-embeddings): OpenCLIP .npy embedding shards and a FAISS index per job on B2.
+- [WebDataset streaming PyTorch training](https://github.com/backblaze-b2-samples/webdataset-streaming-pytorch-training): Tar shards streamed from B2 through a boto3-backed s3:// opener.
+- [Lance multimodal search](https://github.com/backblaze-b2-samples/lance-multimodal-search): LanceDB multimodal tables on B2 for image similarity search.
+- [hf-cache-sync](https://github.com/backblaze-labs/hf-cache-sync): Hugging Face hub cache shared across machines through B2 with LRU pruning.
+- [Backblaze B2 GitHub Action](https://github.com/backblaze-labs/b2-action): CI upload, sync, verify, presign and Object Lock retention verbs.
+- [ComfyUI Cloud Storage nodes](https://github.com/backblaze-labs/comfyui-cloud-storage): ComfyUI save, load, model-cache and presigned-share nodes.
+- [Genblaze SDK](https://github.com/backblaze-labs/genblaze): Provider-agnostic generation with SHA-256 provenance manifests on B2.
+- [B2 browser upload](https://github.com/backblaze-b2-samples/b2-browser-upload): Direct browser uploads with presigned PUT, CORS and server-held keys.
+- [B2 Event Broker](https://github.com/backblaze-b2-samples/b2-event-broker): Signed Event Notification fan-out to multiple subscribers.
+- [B2 Event Notifications thumbnail demo](https://github.com/backblaze-b2-samples/b2-node-thumbnail-demo): Signed object-created event that writes a thumbnail back to B2.
+- [Cloudflare Worker for private B2 bucket](https://github.com/backblaze-b2-samples/cloudflare-b2): SigV4-signing Worker that serves a private bucket through Cloudflare.
+- [Fastly Compute B2 (Rust)](https://github.com/backblaze-b2-samples/fastly-b2-rust): Fastly Compute app with signed origin requests to a private bucket.
+
+## Sample applications: category references
+
+- [Awesome Image Generation](https://github.com/backblaze-labs/awesome-image-generation): Curated list of image generation APIs, models, UIs, GPU clouds and storage tools.
+
+## Schemas and configuration
+
+- [Architecture catalog schema](schemas/architecture-catalog.schema.json): JSON Schema for catalog/architectures.yaml.
+- [B2 configuration examples](examples/README.md): CORS, lifecycle, Object Lock, encryption, notifications, replication, and keys.
+- [Related B2 sample applications](docs/related-b2-samples.md): Sample-to-architecture mapping and selection guidance.
+
+## Official product documentation
+
+- [Backblaze AI and machine learning](https://www.backblaze.com/docs/cloud-storage-ai-machine-learning): Canonical B2 documentation hub.
+- [Backblaze B2 documentation](https://www.backblaze.com/docs/cloud-storage): Current product behavior and setup.
+- [Backblaze B2 pricing](https://www.backblaze.com/cloud-storage/pricing): Current pricing and egress terms.
+
+## Other B2 reference architecture categories
+
+- [AI Data Providers](https://github.com/backblaze-b2-samples/b2-ai-data-provider-reference-architectures)
+- [Generative Video](https://github.com/backblaze-b2-samples/b2-gen-video-reference-architectures)
+- [Robotics](https://github.com/backblaze-b2-samples/b2-robotics-reference-architectures)
+- [Autonomous Vehicles](https://github.com/backblaze-b2-samples/b2-autonomous-vehicle-reference-architectures)
+- [Commercial Drones](https://github.com/backblaze-b2-samples/b2-commercial-drone-reference-architectures)
+
+## Optional
+
+- [Repository agent guide](AGENTS.md): Source hierarchy, generation commands, and operational invariants.
+- [Portable agent skill](skill/SKILL.md): Self-contained guidance for B2 image generation storage work.

@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use these reference architectures, please cite this repository."
+type: software
+title: "B2 Reference Architectures for Image Generation"
+authors:
+  - name: "Backblaze, Inc."
+version: 0.1.0
+date-released: 2026-10-14
+license: MIT
+url: "https://www.backblaze.com/docs/cloud-storage-ai-machine-learning"
+keywords:
+  - image-generation
+  - diffusion-models
+  - model-weights
+  - generative-ai
+  - reference-architecture
+  - backblaze-b2

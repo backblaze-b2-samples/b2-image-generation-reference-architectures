@@ -1,0 +1,15 @@
+{
+  "asReplicationSource": {
+    "sourceApplicationKeyId": "<source-key-id>",
+    "replicationRules": [
+      {
+        "replicationRuleName": "models-to-second-region",
+        "destinationBucketId": "<second-region-models-bucket-id>",
+        "fileNamePrefix": "models/",
+        "includeExistingFiles": true,
+        "isEnabled": true,
+        "priority": 1
+      }
+    ]
+  }
+}

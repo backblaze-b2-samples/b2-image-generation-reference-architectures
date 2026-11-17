@@ -1,0 +1,5 @@
+[
+  {"fileNamePrefix": "drafts/", "daysFromUploadingToHiding": 30, "daysFromHidingToDeleting": 1},
+  {"fileNamePrefix": "inputs/", "daysFromUploadingToHiding": 7, "daysFromHidingToDeleting": 1},
+  {"fileNamePrefix": "runs/", "daysFromUploadingToHiding": null, "daysFromHidingToDeleting": 7}
+]

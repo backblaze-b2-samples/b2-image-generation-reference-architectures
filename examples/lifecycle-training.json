@@ -1,0 +1,4 @@
+[
+  {"fileNamePrefix": "checkpoints/", "daysFromUploadingToHiding": 14, "daysFromHidingToDeleting": 1},
+  {"fileNamePrefix": "samples/", "daysFromUploadingToHiding": 30, "daysFromHidingToDeleting": 1}
+]

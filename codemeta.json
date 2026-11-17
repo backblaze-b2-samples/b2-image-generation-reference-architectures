@@ -1,0 +1,27 @@
+{
+  "@context": "https://doi.org/10.5063/schema/codemeta-2.0",
+  "@type": "SoftwareSourceCode",
+  "name": "B2 Reference Architectures for Image Generation",
+  "description": "Reference architectures, third-party integrations and B2 sample applications for curating image-text corpora, fine-tuning diffusion models, distributing model weights, persisting generated images with provenance, moderating user uploads and delivering galleries with Backblaze B2.",
+  "version": "0.1.0",
+  "dateModified": "2026-10-14",
+  "url": "https://www.backblaze.com/docs/cloud-storage-ai-machine-learning",
+  "license": "https://spdx.org/licenses/MIT",
+  "programmingLanguage": ["Python"],
+  "keywords": [
+    "image-generation",
+    "diffusion-models",
+    "lora",
+    "comfyui",
+    "webdataset",
+    "model-weights",
+    "backblaze-b2",
+    "s3-compatible",
+    "reference-architecture"
+  ],
+  "author": {
+    "@type": "Organization",
+    "name": "Backblaze, Inc.",
+    "url": "https://www.backblaze.com/"
+  }
+}

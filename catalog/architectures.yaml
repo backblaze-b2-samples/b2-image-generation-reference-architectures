@@ -1,0 +1,686 @@
+schema_version: 2.0.0
+updated: "2026-11-16"
+canonical_documentation: https://www.backblaze.com/docs/cloud-storage-ai-machine-learning
+related_categories:
+  - name: AI Data Providers
+    url: https://github.com/backblaze-b2-samples/b2-ai-data-provider-reference-architectures
+  - name: Generative Video
+    url: https://github.com/backblaze-b2-samples/b2-gen-video-reference-architectures
+  - name: Robotics
+    url: https://github.com/backblaze-b2-samples/b2-robotics-reference-architectures
+  - name: Autonomous Vehicles
+    url: https://github.com/backblaze-b2-samples/b2-autonomous-vehicle-reference-architectures
+  - name: Commercial Drones
+    url: https://github.com/backblaze-b2-samples/b2-commercial-drone-reference-architectures
+architectures:
+  - id: image-text-corpus-curation
+    name: Collect and curate image-text corpora into streamable training shards
+    slug: image-text-corpus-curation
+    summary: Bulk-download URL and caption lists into WebDataset shards on B2, score them for CLIP alignment, quality, NSFW and near-duplicates, and write filtered subsets as new immutable shards with a subset manifest. Raw shards are never rewritten; diffusion training streams the subsets directly.
+    audience:
+      - Data engineers building text-to-image training corpora
+      - ML researchers comparing filtering recipes
+      - Storage and security architects
+    problem: Text-to-image corpora hold millions to billions of image-text pairs, and filtering strategy drives model quality. Teams must keep the raw pool and several filtered subsets reproducible without copying them to local disks or rewriting raw data.
+    workflow:
+      - Write URL and caption lists to `raw/<corpus>/urls/`
+      - Run img2dataset with webdataset output to an s3:// output_folder whose fsspec endpoint is the B2 S3 endpoint
+      - Stream shards through CLIP scoring, Data-Juicer recipes, NSFW classifiers and fastdup; write scores to stats/ and embeddings to embeddings/
+      - Record excluded sample keys as parquet exclusion lists under `quarantine/<run>/` instead of rewriting raw shards
+      - Re-pack kept samples into `filtered/<recipe-version>/` shards and write the subset manifest last
+      - Stream filtered shards into PyTorch with WebDataset using per-worker and per-node shard splits
+    capabilities:
+      - S3-compatible API
+      - Multipart upload for large tar shards
+      - Object Lock on a dedicated raw-corpus bucket
+      - Prefix lifecycle rules for scores and intermediates
+      - Prefix-scoped application keys
+      - Presigned URLs as an alternative shard transport
+    integrations:
+      - id: img2dataset
+        name: img2dataset
+        role: Bulk image-text download, resize and WebDataset/parquet sharding
+        connection: 'Set output_folder to `s3://<bucket>/<prefix>` and put client_kwargs.endpoint_url `https://s3.<region>.backblazeb2.com` in ~/.config/fsspec/s3.json; write webdataset or parquet output (the tfrecord writer bypasses fsspec)'
+        connection_type: fsspec-s3
+        url: https://github.com/rom1504/img2dataset
+      - id: s3fs
+        name: s3fs (fsspec)
+        role: Shared Python filesystem layer for download, scoring and re-packing jobs
+        connection: 'Pass endpoint_url `https://s3.<region>.backblazeb2.com` to S3FileSystem (or client_kwargs.endpoint_url in fsspec config) with a scoped B2 application key as key and secret'
+        connection_type: fsspec-s3
+        url: https://s3fs.readthedocs.io/en/latest/
+      - id: webdataset
+        name: WebDataset
+        role: Sequential tar-shard streaming into PyTorch training and scoring jobs
+        connection: 'Open shards with `pipe:aws s3 cp --endpoint-url https://s3.<region>.backblazeb2.com s3://<bucket>/<shard>.tar -`, a gopen handler backed by boto3 with endpoint_url, or presigned HTTPS shard URLs'
+        connection_type: s3-custom-endpoint
+        url: https://github.com/webdataset/webdataset
+      - id: lancedb
+        name: LanceDB
+        role: Embedding tables for deduplication and similarity review
+        connection: Use the pinned LanceDB 0.20.0 / pylance 0.23.2 connection profile in examples/lancedb.md, with the B2 endpoint, region and scoped credentials; serialize all table mutations through one writer service
+        connection_type: s3-custom-endpoint
+        url: https://lancedb.com/
+        setup_url: https://github.com/lance-format/lance/blob/v0.23.2/rust/lance-table/src/io/commit.rs
+    prerequisites:
+      - A dedicated raw-corpus bucket with Object Lock, created separately from the curation work bucket
+      - Prefix-scoped application keys for ingest, curation and training roles
+      - CPU or GPU workers for download and scoring, placed near the B2 region
+      - A dataset catalog database that maps recipes to subsets and records licenses
+    off_object_storage:
+      - Job and shard queue (Ray or Redis)
+      - Crawl dedup and robots cache
+      - Dataset catalog database with corpus records, licenses and recipe-to-subset mapping
+      - Live vector index that serves similarity queries
+      - GPU-local NVMe read-ahead cache
+    expected_scale:
+      profile: Millions to billions of image-text pairs in shards of roughly 0.3-1 GB
+      notes: Standard B2 is the default. Measure sustained multi-node shard-read throughput before considering Overdrive; add a node-local read-ahead cache for repeated epochs over the same subset.
+    security_considerations:
+      - Give the downloader a write-only ingest key scoped to raw/ and training jobs a read-only key scoped to filtered/
+      - Keep the curation key unable to delete from the raw-corpus bucket; Object Lock enforces it independently
+      - Treat presigned shard URLs as bearer credentials with short TTLs
+    compliance_considerations:
+      - Record source URLs, licenses and opt-out handling per corpus in the dataset catalog
+      - Keep exclusion lists so removed samples stay excluded from every future subset
+      - Use governance-mode Object Lock on raw shards; filtered subsets and exclusion lists honour takedowns without touching raw data
+      - When a legal takedown requires deleting a raw object, a separately held provisioning key with bypassGovernance removes it; runtime keys never hold that capability
+    links:
+      architecture: architectures/image-text-corpus-curation/architecture.md
+
+  - id: diffusion-finetune-checkpoints
+    name: Fine-tune LoRA and diffusion models with versioned checkpoints
+    slug: diffusion-finetune-checkpoints
+    summary: Train LoRA, DreamBooth or full fine-tunes on curated subsets, and write each run's dataset snapshot, captions, checkpoints, sample grids and final .safetensors to run-scoped prefixes so interrupted runs resume and released weights trace back to their data.
+    audience:
+      - ML engineers fine-tuning diffusion models
+      - MLOps teams running spot or preemptible GPU fleets
+      - Model governance reviewers
+    problem: Checkpoints range from MB-scale LoRAs to tens of GB with optimizer state. Spot GPUs need resume-from-latest, and the most common trainers write only to local disk.
+    workflow:
+      - Snapshot the training subset and captions to `runs/<run_id>/dataset/` and write run.json
+      - Train with Ray Train using a B2 storage_path, or run diffusers or kohya scripts locally and sync output with rclone
+      - Write intermediate state to `checkpoints/<run_id>/` and sample grids to `samples/<run_id>/`, and keep finals in `runs/<run_id>/final/`
+      - Log params, metrics and the final LoRA to MLflow with a b2:// artifact URI and register the model version
+      - Pin dataset and LoRA versions to git with DVC
+      - For hosted training, pass Replicate a presigned GET URL to the dataset zip and copy the resulting weights back to B2
+      - Expire intermediates by lifecycle rule and publish released weights to a separate Object Lock bucket
+    capabilities:
+      - S3-compatible API
+      - Multipart upload for multi-GB checkpoints
+      - Prefix lifecycle rules for intermediate checkpoints
+      - Object Lock on a dedicated released-weights bucket
+      - Prefix-scoped application keys per run or tenant
+      - Presigned URLs for hosted-training handoff
+    integrations:
+      - id: ray-train
+        name: Ray Train
+        role: Distributed training with checkpoint persistence and resume
+        connection: 'Set RunConfig storage_path to `s3://<bucket>/checkpoints?endpoint_override=https://s3.<region>.backblazeb2.com`, or set AWS_ENDPOINT_URL_S3 with AWS credential variables holding a B2 application key; Ray''s persistent-storage guide covers Backblaze B2'
+        connection_type: s3-custom-endpoint
+        url: https://docs.ray.io/en/latest/train/user-guides/persistent-storage.html
+      - id: mlflow
+        name: MLflow
+        role: Experiment tracking, artifact store and model registry
+        connection: Artifact store URI `b2://<bucket>@s3.<region>.backblazeb2.com/<path>` with AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_DEFAULT_REGION set to a B2 application key and region
+        connection_type: native-b2-option
+        url: https://mlflow.org/docs/latest/self-hosting/architecture/artifact-store/
+      - id: dvc
+        name: DVC
+        role: Git-pinned dataset and weight versions
+        connection: 'Run `dvc remote modify <remote> endpointurl https://s3.<region>.backblazeb2.com` and store the B2 application key with `dvc remote modify --local` access_key_id and secret_access_key'
+        connection_type: s3-custom-endpoint
+        url: https://doc.dvc.org/user-guide/data-management/remote-storage/amazon-s3
+      - id: rclone
+        name: rclone
+        role: Sync between B2 and local-disk trainers, bulk migration and node pre-warm
+        connection: 'Use the native `b2` backend with a scoped application key (or the `s3` backend with the B2 endpoint); `rclone sync` and `rclone copy` move data between B2 and local disk'
+        connection_type: native-b2-option
+        url: https://rclone.org/b2/
+      - id: replicate
+        name: Replicate
+        role: Hosted inference and training API that ingests input files by URL
+        connection: Presigned B2 GET URLs passed as hosted-file inputs; outputs are copied back to B2 because API output files are deleted after one hour
+        connection_type: presigned-url
+        url: https://replicate.com/docs/topics/predictions/input-files
+        setup_url: https://replicate.com/docs/topics/predictions/data-retention
+    prerequisites:
+      - A training bucket for run snapshots, checkpoints and samples, plus a separate Object Lock bucket for released weights
+      - A per-run or per-tenant application key scoped to the run prefix
+      - An MLflow tracking server with its backend store on Postgres or MySQL
+      - GPU nodes with local NVMe scratch for active shards and in-progress checkpoint writes
+    off_object_storage:
+      - GPU-local NVMe scratch for active shards and in-progress checkpoint writes
+      - MLflow backend store (Postgres or MySQL) with metrics, stages and aliases
+      - Job scheduler state
+      - Replicate's transient training storage
+    expected_scale:
+      profile: Tens to thousands of runs, with checkpoints from MB-scale LoRAs to tens of GB with optimizer state
+      notes: Standard B2 handles checkpoint writes and resume reads. Lifecycle rules on checkpoints/ keep storage from growing with every step.
+    security_considerations:
+      - Scope trainer keys to one run or tenant prefix; trainers never hold delete rights on the released-weights bucket
+      - Issue presigned dataset URLs to hosted trainers with the shortest TTL that covers the job start
+      - Keep MLflow and DVC credentials in environment or secret stores, never in tracked config
+    compliance_considerations:
+      - Keep run.json, the dataset snapshot reference and captions with each released weight for lineage
+      - Record base-model licenses next to derived weights
+      - Set released-weights retention from model-governance policy
+    links:
+      architecture: architectures/diffusion-finetune-checkpoints/architecture.md
+
+  - id: model-weight-distribution
+    name: Distribute base checkpoints and LoRAs to a GPU inference fleet
+    slug: model-weight-distribution
+    summary: Keep base checkpoints, VAEs, ControlNets and LoRAs once under a B2 models/ prefix; ComfyUI hosts, serverless GPU functions and CI pull from it into node-local caches with read-only keys and skip unchanged files.
+    audience:
+      - Inference platform engineers
+      - Teams running ComfyUI or diffusers fleets
+      - Serverless GPU developers
+    problem: SDXL and FLUX weights are several GB each and catalogs hold hundreds to thousands of LoRAs. Re-downloading from public hubs on every new GPU node is slow and rate-limited, and copies drift across the fleet.
+    workflow:
+      - CI publishes approved weights under immutable versioned keys in models/, with model card and license beside them, and writes a mutable latest pointer last
+      - Mirror Hugging Face hub caches to B2 under team prefixes with hf-cache-sync
+      - ComfyUI hosts pull into models/ with the Download Model from Cloud node, which skips files whose ETag matches
+      - Modal functions mount the models/ prefix read-only with CloudBucketMount and a B2 bucket_endpoint_url
+      - Bulk-migrate existing checkpoint libraries and pre-warm nodes with rclone
+      - Prune node-local caches with LRU eviction; B2 stays the source of truth
+    capabilities:
+      - S3-compatible API
+      - ETag comparison for change detection
+      - Multipart upload
+      - Read-only prefix-scoped application keys
+      - Object Lock or versioning on released weights
+      - Cloud Replication for multi-region fleets
+    integrations:
+      - id: comfyui-cloud-storage
+        name: ComfyUI Cloud Storage nodes
+        role: ComfyUI custom nodes for model download and cache, output save, input load and presigned sharing
+        connection: '"Backblaze B2" provider preset (COMFY_S3_PROVIDER, COMFY_S3_REGION) or COMFY_S3_ENDPOINT_URL; credentials resolve from env vars or a server-side JSON profile, never workflow JSON'
+        connection_type: native-b2-option
+        url: https://github.com/backblaze-labs/comfyui-cloud-storage
+      - id: hf-cache-sync
+        name: hf-cache-sync
+        role: Push and pull the Hugging Face hub cache to B2 with LRU pruning
+        connection: Set B2_APPLICATION_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET, B2_REGION and B2_ENDPOINT (or the YAML storage block); the boto3 client talks to the B2 S3 endpoint
+        connection_type: native-b2-option
+        url: https://github.com/backblaze-labs/hf-cache-sync
+      - id: modal-cloud-bucket-mount
+        name: Modal CloudBucketMount
+        role: Read-only bucket mount for serverless GPU functions
+        connection: '`CloudBucketMount(bucket_name, bucket_endpoint_url="https://s3.<region>.backblazeb2.com", key_prefix="models/", read_only=True, secret=...)` with a secret holding a B2 application key'
+        connection_type: s3-custom-endpoint
+        url: https://modal.com/docs/reference/modal.CloudBucketMount
+      - id: rclone
+        name: rclone
+        role: Sync between B2 and local-disk trainers, bulk migration and node pre-warm
+        connection: 'Use the native `b2` backend with a scoped application key (or the `s3` backend with the B2 endpoint); `rclone sync` and `rclone copy` move data between B2 and local disk'
+        connection_type: native-b2-option
+        url: https://rclone.org/b2/
+    prerequisites:
+      - A models bucket written only by CI, with versioning or Object Lock on released weights
+      - Read-only application keys scoped to models/ for every worker
+      - Node-local disk sized for the working set of checkpoints and LoRAs
+    off_object_storage:
+      - Node-local model directories and caches that the runtime loads from
+      - Model registry metadata (stages, aliases, approvals)
+      - ComfyUI workflow JSON, which must hold no credentials
+      - Inference GPU memory
+    expected_scale:
+      profile: Hundreds to thousands of weight files from MB-scale LoRAs to tens of GB, pulled by tens to thousands of GPU nodes
+      notes: Standard B2 for publish and steady-state pulls. Fleet-wide cold starts that pull the same large files at once are the case to measure for Overdrive; node-local caches remove repeat reads.
+    security_considerations:
+      - Only CI holds write keys to models/; workers get listFiles and readFiles on the models/ prefix
+      - Verify SHA-256 from the model card or manifest after download; multipart ETags are not content hashes
+      - Keep provider credentials out of shareable ComfyUI workflow JSON
+    compliance_considerations:
+      - Store each model's license and card beside its weights and copy them into node caches
+      - Keep removed or revoked weights out of the latest pointer and record the revocation
+    links:
+      architecture: architectures/model-weight-distribution/architecture.md
+
+  - id: generation-output-provenance
+    name: Generate images and persist every output with provenance manifests
+    slug: generation-output-provenance
+    summary: Text-to-image and edit apps call self-hosted pipelines or hosted APIs, write every output to B2 immediately, and store a SHA-256 manifest of provider, model, prompt, params, seed and parent asset beside it so remix lineage, replays and audits stay possible.
+    audience:
+      - Developers of text-to-image and image-editing applications
+      - Platform teams calling hosted image APIs
+      - Trust and safety and audit reviewers
+    problem: Hosted output URLs are ephemeral, and consumer apps produce millions of images a month. Without a durable store and manifests next to the bytes, lineage and replay are lost.
+    workflow:
+      - The app or node graph submits a prompt; reference inputs go to the provider as presigned GET URLs
+      - Application workers persist outputs and manifest.json under `runs/<tenant>/<date>/<run_id>/` or content-addressed `assets/<sha256>`
+      - A separate audit publisher copies approved manifests to the audit bucket when retention is required
+      - ComfyUI Save to Cloud nodes write graph outputs and return presigned share URLs
+      - fal.ai and Replicate outputs are copied to B2 as soon as they arrive
+      - Optionally sign C2PA in the app and store the sidecar next to the asset
+      - Index outputs in the app database or Pixeltable tables; the bucket stays the system of record
+    capabilities:
+      - S3-compatible API
+      - Presigned URLs for input handoff and private sharing
+      - Per-tenant prefix-scoped application keys
+      - Prefix lifecycle rules for abandoned drafts
+      - Object Lock on a dedicated audit-manifest bucket
+      - Event Notifications to trigger indexing
+    integrations:
+      - id: comfyui-cloud-storage
+        name: ComfyUI Cloud Storage nodes
+        role: ComfyUI custom nodes for model download and cache, output save, input load and presigned sharing
+        connection: Save to Cloud and Load from Cloud nodes with the "Backblaze B2" provider preset; Generate Sharing URL node for presigned links
+        connection_type: native-b2-option
+        url: https://github.com/backblaze-labs/comfyui-cloud-storage
+      - id: fal
+        name: fal.ai
+        role: Hosted image generation and editing API
+        connection: image_url inputs accept presigned S3-compatible URLs; outputs are copied back to B2
+        connection_type: presigned-url
+        url: https://fal.ai/docs/documentation/model-apis/fal-cdn
+      - id: replicate
+        name: Replicate
+        role: Hosted inference and training API that ingests input files by URL
+        connection: Presigned B2 GET URLs passed as hosted-file inputs; outputs are copied back to B2 because API output files are deleted after one hour
+        connection_type: presigned-url
+        url: https://replicate.com/docs/topics/predictions/input-files
+        setup_url: https://replicate.com/docs/topics/predictions/data-retention
+      - id: pixeltable
+        name: Pixeltable
+        role: Multimodal tables that index generated images and their metadata
+        connection: Backblaze B2 destination `https://s3.<region>.backblazeb2.com/<bucket>/<prefix>/` with b2_profile in config.toml and keys under a [b2] AWS credentials profile
+        connection_type: native-b2-option
+        url: https://docs.pixeltable.com/integrations/cloud-storage
+    prerequisites:
+      - An outputs bucket with per-tenant prefixes, plus a separate Object Lock bucket if manifests are audit records
+      - A server-side signer key that is scoped to inputs/ for presigned handoff
+      - An application database for users, galleries and prompt history
+    off_object_storage:
+      - Request queue and GPU worker state
+      - Rate limits, credits and billing
+      - User, gallery and prompt-history database
+      - Prompt and result caches
+      - C2PA signing keys
+    expected_scale:
+      profile: Thousands to millions of generated images per month, each a few hundred KB to a few MB, plus a small manifest
+      notes: Request count, not bandwidth, dominates. Standard B2 fits; batch small writes where the SDK allows and keep listing out of hot request paths.
+    security_considerations:
+      - Use per-tenant prefix-scoped keys or a server-side signer that enforces the tenant prefix
+      - Give providers presigned GETs with short TTLs, never application keys
+      - Keep C2PA signing keys in a KMS or HSM, not in the bucket
+    compliance_considerations:
+      - Store prompts, model, provider and parent asset in the manifest for audit and takedown
+      - Apply content-policy moderation before outputs become public
+      - Set retention for audit manifests separately from deletable user outputs
+    links:
+      architecture: architectures/generation-output-provenance/architecture.md
+
+  - id: user-upload-moderation-personalization
+    name: Ingest, moderate and purge user-uploaded reference images
+    slug: user-upload-moderation-personalization
+    summary: Browsers upload selfies, product photos and reference images directly to a private uploads/ prefix with presigned PUTs; an Event Notification triggers moderation and EXIF stripping; approved items reach edit APIs and likeness-LoRA training only as short-lived presigned GETs, and subject deletion coordinates active writers, every B2 version, quarantined originals, and provider copies.
+    audience:
+      - Developers of personalization, avatar and product-photo apps
+      - Trust and safety engineers
+      - Privacy and security reviewers
+    problem: Uploads are PII- and biometric-adjacent, arrive at high request counts, and must not flow through app servers. Teams need moderation before use, short retention and verifiable deletion.
+    workflow:
+      - The app issues a presigned PUT, through Uppy Companion or its own API, scoped to `uploads/<tenant>/<subject>/`; CORS allows only the app origin
+      - A B2 Event Notification on object creation triggers moderation
+      - Approved items are EXIF-stripped and the stripped bytes are PUT to `approved/<tenant>/<subject>/`; rejected items are copied server-side to `quarantine/<tenant>/<subject>/<batch>/`; decisions go to `audit/moderation/<tenant>/<subject>/`
+      - Approved references go to fal.ai or Replicate edit and LoRA-training endpoints as short-expiry presigned GET URLs
+      - Outputs return to `subjects/<tenant>/<subject>/outputs/`; the consent DB inventories B2 versions and provider request/model IDs
+      - A deletion request marks the subject deleting, blocks new signing and writes, drains active uploads/jobs, and confirms provider deletion or data-retention expiry before completing
+    capabilities:
+      - Presigned PUT and GET URLs
+      - CORS rules for browser uploads
+      - Event Notifications with signed webhooks
+      - Server-side copy for quarantine routing
+      - Prefix lifecycle rules for raw-upload expiry
+      - Prefix-scoped application keys
+      - SSE-B2 encryption at rest
+    integrations:
+      - id: uppy-companion
+        name: Uppy + Companion
+        role: Browser upload UI and signing server
+        connection: 'Set s3.endpoint (COMPANION_AWS_ENDPOINT) to `https://s3.<region>.backblazeb2.com` and s3.region to the bucket region; browsers upload straight to the bucket with presigned PUT or multipart requests, so configure bucket CORS'
+        connection_type: s3-custom-endpoint
+        url: https://uppy.io/docs/companion/
+      - id: fal
+        name: fal.ai
+        role: Hosted image generation and editing API
+        connection: Short-expiry presigned GETs of approved references passed as image_url inputs
+        connection_type: presigned-url
+        url: https://fal.ai/docs/documentation/model-apis/fal-cdn
+      - id: replicate
+        name: Replicate
+        role: Hosted inference and training API that ingests input files by URL
+        connection: Presigned GET of the approved image set as the hosted-file input for LoRA training
+        connection_type: presigned-url
+        url: https://replicate.com/docs/topics/predictions/input-files
+        setup_url: https://replicate.com/docs/topics/predictions/data-retention
+    prerequisites:
+      - A private uploads bucket without Object Lock, with SSE-B2 default encryption and CORS for the app origin
+      - A signer key that can only write uploads/ and a moderation key scoped to the uploads bucket (listFiles, readFiles, writeFiles), or separate per-prefix keys
+      - A webhook receiver that verifies the B2 Event Notification signature
+      - Subject state, consent, retention, object inventory and provider deletion records in the application database
+    off_object_storage:
+      - Auth and user database
+      - Consent and retention records
+      - Moderation decision and appeal database
+      - Processing queue
+      - Classifier GPU or CPU workers
+    expected_scale:
+      profile: Many small uploads (a few to dozens per subject) with bursty request rates
+      notes: Request count and event throughput dominate, not bandwidth. Keep the webhook fast and idempotent and do the heavy work from a queue.
+    security_considerations:
+      - Never expose application keys to browsers; sign uploads server-side for an exact key and content type
+      - Verify X-Bz-Event-Notification-Signature and process events idempotently
+      - Do not enable Object Lock on the uploads bucket, or per-subject purge cannot complete
+      - Strip EXIF (including GPS) before any third-party handoff
+    compliance_considerations:
+      - Record consent and the retention period per subject before training on likeness data
+      - Purge removes all versions and delete markers from uploads, approved, quarantine, outputs and subject audit prefixes, reconciles late work, and records a minimal deletion receipt
+      - Check biometric-data obligations in the jurisdictions you serve
+    links:
+      architecture: architectures/user-upload-moderation-personalization/architecture.md
+
+  - id: gallery-cdn-delivery
+    name: Serve generated galleries through a CDN with on-the-fly variants
+    slug: gallery-cdn-delivery
+    summary: Approved outputs are served from a private B2 origin through Cloudflare Workers or a bunny.net pull zone with S3 authentication, and imgproxy resizes and converts originals on request so per-size variants live in the edge cache instead of the bucket.
+    audience:
+      - Developers of image galleries, feeds and marketplaces
+      - Web performance and CDN engineers
+    problem: Galleries get far more reads than writes, with long-tail access to old generations. Storing every thumbnail size multiplies object counts, and serving directly from the origin raises egress costs.
+    workflow:
+      - Promote approved outputs to a delivery prefix and set Cache-Control at upload
+      - A Cloudflare Worker signs origin requests to the private bucket with a read-only key, or a bunny.net pull zone uses S3 authentication
+      - imgproxy reads originals from B2 and serves thumbnails and WebP or AVIF variants behind the CDN
+      - Private items use short-lived presigned URLs instead of CDN paths
+      - An Event Notification handler purges the CDN cache when an item is unpublished
+    capabilities:
+      - S3-compatible API
+      - Read-only application keys for origin signing
+      - Cache-Control set at upload
+      - Presigned URLs for private items
+      - Free egress to CDN partners
+    integrations:
+      - id: cloudflare-workers
+        name: Cloudflare Workers (private bucket)
+        role: CDN edge that signs requests to a private B2 origin
+        connection: 'Deploy a Worker that signs origin requests to `s3.<region>.backblazeb2.com` with a read-only application key; the bucket stays private behind the CDN'
+        connection_type: cdn-origin
+        url: https://www.backblaze.com/docs/cloud-storage-deliver-private-backblaze-b2-content-through-cloudflare-cdn
+      - id: bunny-net
+        name: bunny.net
+        role: CDN pull zone with S3-authenticated private origin
+        connection: Set the pull zone origin to the bucket's S3 URL, enable S3 Authentication with the key ID, application key and bucket region, and enable Block Root Path Access
+        connection_type: cdn-origin
+        url: https://www.backblaze.com/docs/cloud-storage-integrate-bunnynet-with-backblaze-b2
+        setup_url: https://docs.bunny.net/cdn/integrations/storage/backblaze
+      - id: imgproxy
+        name: imgproxy
+        role: On-the-fly resize and WebP/AVIF conversion behind the CDN
+        connection: 'Set `IMGPROXY_USE_S3=true`, `IMGPROXY_S3_ENDPOINT=https://s3.<region>.backblazeb2.com` and `IMGPROXY_S3_REGION` to the bucket region; source URLs use `s3://<bucket>/<key>`'
+        connection_type: s3-custom-endpoint
+        url: https://docs.imgproxy.net/image_sources/amazon_s3
+    prerequisites:
+      - A private delivery bucket or prefix with a read-only origin key
+      - A CDN account with a B2 partner path (see B2 pricing for current egress terms)
+      - imgproxy deployed near the CDN with URL signing enabled
+    off_object_storage:
+      - CDN edge cache
+      - imgproxy cache
+      - Gallery and feed database and search index
+      - Like and view counters
+      - Worker secrets store
+    expected_scale:
+      profile: Read-heavy galleries with long-tail access across millions of images
+      notes: CDN cache hit rate decides origin load. Store originals once and let the edge cache variants; Overdrive is not usually the bottleneck here.
+    security_considerations:
+      - Keep the bucket private and give the CDN a read-only key scoped to the delivery prefix
+      - Sign imgproxy URLs so the transformer cannot be used as an open proxy
+      - Never route private items through shared CDN caches; use presigned URLs instead
+    compliance_considerations:
+      - Purge CDN caches when content is unpublished or taken down
+      - Keep takedown records with the source asset's manifest
+    links:
+      architecture: architectures/gallery-cdn-delivery/architecture.md
+
+samples:
+  - id: img2dataset-webdataset-object-storage
+    name: img2dataset to WebDataset on B2
+    url: https://github.com/backblaze-b2-samples/img2dataset-webdataset-object-storage
+    group: workflow
+    summary: img2dataset shards, parquet and stats streamed into B2 with no local staging
+    description: Streams img2dataset WebDataset shards, parquet metadata and _stats.json into B2 under `img2dataset/<corpus-id>/shards/` with no local staging disk.
+    architectures: [image-text-corpus-curation]
+
+  - id: datacomp-image-text-filtering
+    name: DataComp image-text filtering
+    url: https://github.com/backblaze-b2-samples/datacomp-image-text-filtering
+    group: workflow
+    summary: CLIP scoring of streamed shards with filtered shards and metrics written back
+    description: Streams WebDataset shards from B2, CLIP-scores image-text pairs, applies baseline filters and writes filtered shards plus quality metrics back to B2.
+    architectures: [image-text-corpus-curation]
+
+  - id: data-juicer-multimodal-curation
+    name: Data-Juicer multimodal curation
+    url: https://github.com/backblaze-b2-samples/data-juicer-multimodal-curation
+    group: workflow
+    summary: Data-Juicer recipes over raw shards with refined outputs and stats per run
+    description: Runs Data-Juicer recipes over raw/ data and writes `refined/<run>/`, `stats/<run>.json` and the recipe config back to B2.
+    architectures: [image-text-corpus-curation]
+
+  - id: fastdup-dataset-cleaning
+    name: fastdup dataset cleaning
+    url: https://github.com/backblaze-b2-samples/fastdup-dataset-cleaning
+    group: workflow
+    summary: Duplicate, outlier and broken-file detection with server-side-copy quarantine
+    description: Finds duplicates, outliers and broken files among loose images and quarantines them by server-side copy without deleting the originals.
+    architectures: [image-text-corpus-curation, diffusion-finetune-checkpoints]
+
+  - id: openclip-batch-embeddings
+    name: OpenCLIP batch embeddings
+    url: https://github.com/backblaze-b2-samples/openclip-batch-embeddings
+    group: building-block
+    summary: OpenCLIP .npy embedding shards and a FAISS index per job on B2
+    description: Batch-writes OpenCLIP .npy embedding shards and a FAISS index per job to B2 for semantic search and near-duplicate review.
+    architectures: [image-text-corpus-curation]
+
+  - id: webdataset-streaming-pytorch-training
+    name: WebDataset streaming PyTorch training
+    url: https://github.com/backblaze-b2-samples/webdataset-streaming-pytorch-training
+    group: building-block
+    summary: Tar shards streamed from B2 through a boto3-backed s3:// opener
+    description: Packs tar shards on B2 and streams them into an IterableDataset through a boto3-backed s3:// opener with per-worker and per-node shard splits.
+    architectures: [image-text-corpus-curation, diffusion-finetune-checkpoints]
+
+  - id: lance-multimodal-search
+    name: Lance multimodal search
+    url: https://github.com/backblaze-b2-samples/lance-multimodal-search
+    group: building-block
+    summary: LanceDB multimodal tables on B2 for image similarity search
+    description: Stores LanceDB multimodal tables on B2 and runs similarity search over images directly from object storage.
+    architectures: [image-text-corpus-curation]
+
+  - id: lora-training-studio
+    name: LoRA Training Studio
+    url: https://github.com/backblaze-b2-samples/lora-training-studio
+    group: workflow
+    summary: Diffusers and peft LoRA training with every artifact under a run prefix
+    description: Trains SD1.5 LoRAs with diffusers and peft and writes every artifact under `lora-training/{run_id}/` with a run.json manifest.
+    architectures: [diffusion-finetune-checkpoints]
+
+  - id: ai-headshot-studio
+    name: AI Headshot Studio
+    url: https://github.com/backblaze-b2-samples/ai-headshot-studio
+    group: workflow
+    summary: Likeness LoRA from selfies with presigned-only access and per-subject purge
+    description: Trains a likeness LoRA from selfies (local SD1.5 or hosted FLUX LoRA on Replicate) under `subjects/{id}/`, with presigned-only access and per-subject purge.
+    architectures: [user-upload-moderation-personalization, diffusion-finetune-checkpoints]
+
+  - id: hf-cache-sync
+    name: hf-cache-sync
+    url: https://github.com/backblaze-labs/hf-cache-sync
+    group: building-block
+    summary: Hugging Face hub cache shared across machines through B2 with LRU pruning
+    description: Pushes and pulls the Hugging Face hub cache to B2 under team prefixes and caps local disk with LRU pruning.
+    architectures: [model-weight-distribution]
+
+  - id: b2-action
+    name: Backblaze B2 GitHub Action
+    url: https://github.com/backblaze-labs/b2-action
+    group: building-block
+    summary: CI upload, sync, verify, presign and Object Lock retention verbs
+    description: GitHub Action with multipart upload, sync, SHA-1 verify, presign and Object Lock retention verbs; fits publishing versioned weights from CI.
+    architectures: [model-weight-distribution, diffusion-finetune-checkpoints]
+
+  - id: comfyui-cloud-storage
+    name: ComfyUI Cloud Storage nodes
+    url: https://github.com/backblaze-labs/comfyui-cloud-storage
+    group: building-block
+    summary: ComfyUI save, load, model-cache and presigned-share nodes
+    description: ComfyUI nodes that save outputs, load inputs, download and cache models with ETag skip, and generate presigned share URLs.
+    architectures: [model-weight-distribution, generation-output-provenance]
+
+  - id: genblaze
+    name: Genblaze SDK
+    url: https://github.com/backblaze-labs/genblaze
+    group: building-block
+    summary: Provider-agnostic generation with SHA-256 provenance manifests on B2
+    description: Provider-agnostic generative-media SDK that writes outputs and SHA-256 provenance manifests to B2.
+    architectures: [generation-output-provenance]
+
+  - id: genblaze-gen-media-multi-provider-sample
+    name: Genblaze multi-provider sample
+    url: https://github.com/backblaze-labs/genblaze-gen-media-multi-provider-sample
+    group: workflow
+    summary: Multi-provider pipeline with run-scoped prefixes and lifecycle suggestions
+    description: Multi-provider generation pipeline with run-scoped prefixes and suggested lifecycle rules.
+    architectures: [generation-output-provenance]
+
+  - id: genblaze-gmicloud-pipeline
+    name: Genblaze x GMICloud pipeline
+    url: https://github.com/backblaze-labs/genblaze-gmicloud-pipeline
+    group: workflow
+    summary: Anchor image fanned out to video models with manifests on B2
+    description: Generates an anchor image and fans it out to video models; every artifact goes to B2 with a manifest.
+    architectures: [generation-output-provenance]
+
+  - id: image-generation-prompt-flow
+    name: Image Generation Prompt Flow
+    url: https://github.com/backblaze-b2-samples/image-generation-prompt-flow
+    group: workflow
+    summary: Provider comparison app with image bytes on B2 and prompt history in SQLite
+    description: Compares image providers; image bytes go to B2 and prompt history stays in SQLite.
+    architectures: [generation-output-provenance]
+
+  - id: ai-moodboard-generator
+    name: AI Moodboard Generator
+    url: https://github.com/backblaze-b2-samples/ai-moodboard-generator
+    group: workflow
+    summary: Generated pins with sha256 sidecars delivered by presigned or CDN URLs
+    description: Stores gpt-image-1 pins under `boards/<slug>/` with sha256 sidecars, delivered through presigned URLs or a public/CDN mode.
+    architectures: [generation-output-provenance, gallery-cdn-delivery]
+
+  - id: ai-product-photo-studio
+    name: AI Product Photo Studio
+    url: https://github.com/backblaze-b2-samples/ai-product-photo-studio
+    group: workflow
+    summary: Presigned reference handoff to image edits with per-run manifests
+    description: Hands reference images to gpt-image-1 edits through presigned URLs; outputs and a manifest go under `skus/<sku>/generations/<run_id>/`.
+    architectures: [generation-output-provenance, user-upload-moderation-personalization]
+
+  - id: ai-sticker-pack-generator
+    name: AI Sticker Pack Generator
+    url: https://github.com/backblaze-b2-samples/ai-sticker-pack-generator
+    group: workflow
+    summary: Bucket as the system of record for generated packs, no database
+    description: Uses the bucket as the system of record for generated sticker packs, with no database.
+    architectures: [generation-output-provenance]
+
+  - id: comic-storyboard-b2
+    name: Comic Storyboard
+    url: https://github.com/backblaze-b2-samples/comic-storyboard-b2
+    group: workflow
+    summary: Character-consistent panels with variant lineage and SHA-256 manifests
+    description: Character-consistent FLUX panels with variant lineage and SHA-256 manifests through Genblaze.
+    architectures: [generation-output-provenance]
+
+  - id: ai-saas-starter-kit
+    name: AI SaaS Starter Kit
+    url: https://github.com/backblaze-labs/ai-saas-starter-kit
+    group: workflow
+    summary: Multi-tenant generation into B2 with presigned browser uploads
+    description: Multi-tenant SaaS starter that generates with NVIDIA NIM FLUX into B2 and accepts browser uploads through presigned PUT.
+    architectures: [user-upload-moderation-personalization, generation-output-provenance]
+
+  - id: clip-nsfw-image-moderation
+    name: CLIP NSFW image moderation
+    url: https://github.com/backblaze-b2-samples/clip-nsfw-image-moderation
+    group: workflow
+    summary: Approve or quarantine routing with JSONL and CSV audit logs
+    description: Routes images from incoming/ to approved/ or `quarantine/<batch-id>/` and writes JSONL and CSV audit logs.
+    architectures: [user-upload-moderation-personalization, image-text-corpus-curation]
+
+  - id: lama-batch-inpainting
+    name: LaMa batch inpainting
+    url: https://github.com/backblaze-b2-samples/lama-batch-inpainting
+    group: workflow
+    summary: Source, mask and output prefixes with an approval step
+    description: Keeps source, mask and output prefixes with an approval step; source images and derivatives are both kept.
+    architectures: [generation-output-provenance]
+
+  - id: rembg-product-background-removal
+    name: rembg product background removal
+    url: https://github.com/backblaze-b2-samples/rembg-product-background-removal
+    group: workflow
+    summary: Batch transparent cutouts with an optional public or CDN URL base
+    description: Produces batch transparent product cutouts on B2 with an optional public or CDN URL base.
+    architectures: [generation-output-provenance, gallery-cdn-delivery]
+
+  - id: b2-browser-upload
+    name: B2 browser upload
+    url: https://github.com/backblaze-b2-samples/b2-browser-upload
+    group: building-block
+    summary: Direct browser uploads with presigned PUT, CORS and server-held keys
+    description: Direct browser uploads to B2 through a presigned S3 PutObject URL or the native API, with CORS and keys kept on the server.
+    architectures: [user-upload-moderation-personalization]
+
+  - id: b2-event-broker
+    name: B2 Event Broker
+    url: https://github.com/backblaze-b2-samples/b2-event-broker
+    group: building-block
+    summary: Signed Event Notification fan-out to multiple subscribers
+    description: Validates signed B2 Event Notifications, acknowledges promptly and fans them out to subscribers such as moderation, thumbnails and indexing.
+    architectures: [user-upload-moderation-personalization, gallery-cdn-delivery]
+
+  - id: b2-node-thumbnail-demo
+    name: B2 Event Notifications thumbnail demo
+    url: https://github.com/backblaze-b2-samples/b2-node-thumbnail-demo
+    group: building-block
+    summary: Signed object-created event that writes a thumbnail back to B2
+    description: A signed object-created Event Notification triggers a handler that writes a thumbnail back to B2.
+    architectures: [gallery-cdn-delivery, user-upload-moderation-personalization]
+
+  - id: cloudflare-b2
+    name: Cloudflare Worker for private B2 bucket
+    url: https://github.com/backblaze-b2-samples/cloudflare-b2
+    group: building-block
+    summary: SigV4-signing Worker that serves a private bucket through Cloudflare
+    description: Cloudflare Worker that SigV4-signs requests so a private bucket is served only through Cloudflare.
+    architectures: [gallery-cdn-delivery]
+
+  - id: fastly-b2-rust
+    name: Fastly Compute B2 (Rust)
+    url: https://github.com/backblaze-b2-samples/fastly-b2-rust
+    group: building-block
+    summary: Fastly Compute app with signed origin requests to a private bucket
+    description: Fastly Compute app that sends signed origin requests to a private B2 bucket.
+    architectures: [gallery-cdn-delivery]
+
+  - id: awesome-image-generation
+    name: Awesome Image Generation
+    url: https://github.com/backblaze-labs/awesome-image-generation
+    group: domain
+    summary: Curated list of image generation APIs, models, UIs, GPU clouds and storage tools
+    description: Curated list of image generation APIs, models, UIs, GPU clouds and storage and delivery tools.

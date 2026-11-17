@@ -1,0 +1,17 @@
+{
+  "bucketId": "<uploads-bucket-id>",
+  "eventNotificationRules": [
+    {
+      "name": "moderate-on-upload",
+      "eventTypes": ["b2:ObjectCreated:Upload", "b2:ObjectCreated:MultipartUpload"],
+      "objectNamePrefix": "uploads/",
+      "isEnabled": true,
+      "maxEventsPerBatch": 1,
+      "targetConfiguration": {
+        "targetType": "webhook",
+        "url": "https://hooks.example.com/b2/moderate",
+        "hmacSha256SigningSecret": "<32-char-alphanumeric-secret>"
+      }
+    }
+  ]
+}

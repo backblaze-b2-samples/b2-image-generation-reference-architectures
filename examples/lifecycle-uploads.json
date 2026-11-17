@@ -1,0 +1,4 @@
+[
+  {"fileNamePrefix": "uploads/", "daysFromUploadingToHiding": 7, "daysFromHidingToDeleting": 1},
+  {"fileNamePrefix": "quarantine/", "daysFromUploadingToHiding": 30, "daysFromHidingToDeleting": 1}
+]

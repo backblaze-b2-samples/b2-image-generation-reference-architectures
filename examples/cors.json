@@ -1,0 +1,10 @@
+[
+  {
+    "corsRuleName": "app-presigned-uploads",
+    "allowedOrigins": ["https://app.example.com"],
+    "allowedOperations": ["s3_put", "s3_head"],
+    "allowedHeaders": ["*"],
+    "exposeHeaders": ["ETag"],
+    "maxAgeSeconds": 3600
+  }
+]
